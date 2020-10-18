@@ -1,0 +1,454 @@
+from kivy.app import App
+from kivy.properties import ListProperty, BooleanProperty, ObjectProperty, NumericProperty, StringProperty
+from kivy.vector import Vector
+from kivy.clock import Clock
+import numpy as np
+from enum import Enum
+import tensorflow as tf
+from tensorflow.python.framework.tensor_spec import BoundedTensorSpec
+from tf_agents.environments.py_environment import PyEnvironment
+from tf_agents.specs import array_spec, TensorSpec
+from tf_agents.environments import tf_environment
+from tf_agents.environments import tf_py_environment
+from tf_agents.environments import utils
+from tf_agents.agents.dqn import dqn_agent
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.metrics import tf_metrics
+from tf_agents.drivers import dynamic_step_driver
+import tensorflow as tf
+from tf_agents.agents import DqnAgent, TFAgent, SacAgent
+from tf_agents.agents.ddpg.actor_network import ActorNetwork
+from tf_agents.agents.ddpg.critic_network import CriticNetwork
+from tf_agents.agents.tf_agent import LossInfo
+from tf_agents.environments.py_environment import PyEnvironment
+from tf_agents.environments.tf_py_environment import TFPyEnvironment
+from tf_agents.networks.actor_distribution_network import ActorDistributionNetwork
+from tf_agents.replay_buffers.tf_uniform_replay_buffer import TFUniformReplayBuffer
+from tf_agents.trajectories import trajectory
+from tf_agents.trajectories import time_step as ts
+from tf_agents.trajectories.time_step import TimeStep
+from tf_agents.trajectories.trajectory import Trajectory
+from tf_agents.policies.policy_saver import PolicySaver
+from typing import Tuple, List, Callable, Optional
+import os
+
+
+class ActionState(Enum):
+    VALID_MOVE = 1
+    ILLEGAL_MOVE = 2
+    CHANGE_POSSESSION = 3
+    DOWN_INCREASE = 4
+    TOUCHDOWN = 5
+    GAME_COMPLETE = 6
+
+
+class NoughtEnv(PyEnvironment):
+
+    def __init__(self, game):
+        self._action_spec = array_spec.BoundedArraySpec((22,), np.float32, minimum=0, maximum=1.5, name='moves')
+        self._observation_spec = array_spec.BoundedArraySpec((13, 4), np.float32, minimum=0, maximum=1, name='field')
+        self._episode_ended = False
+        self.game = game
+        self._state = [[0.9, 0.18759375, 0., 0.],
+                       [0.125, 0.18759375, 0., 0.],
+                       [0.5835, 0.18759375, 0., 0.],
+                       [0.4165, 0.18759375, 0., 0.],
+                       [0.5, 0.18759375, 0., 0.],
+                       [0.9, 0.0939375, 0., 0.],
+                       [0.125, 0.0939375, 0., 0.],
+                       [0.5835, 0.0939375, 0., 0.],
+                       [0.4165, 0.0939375, 0., 0.],
+                       [0.5, 0.04696875, 1., 0.],
+                       [0.5215, 0.04696875, 0., 0.],
+                       [1., 0., 0., 0.],
+                       [0., 0., 0., 0.]]
+
+        self.response = ActionState.VALID_MOVE
+        self.count = 0
+        App.get_running_app().env = self
+        
+    def action_spec(self):
+
+        return self._action_spec
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def _reset(self):
+        print(f'===\n ended. resetting\n===')
+
+        self.count = 0
+        self._state = [[0.9, 0.18759375, 0., 0.],
+                       [0.125, 0.18759375, 0., 0.],
+                       [0.5835, 0.18759375, 0., 0.],
+                       [0.4165, 0.18759375, 0., 0.],
+                       [0.5, 0.18759375, 0., 0.],
+                       [0.9, 0.0939375, 0., 0.],
+                       [0.125, 0.0939375, 0., 0.],
+                       [0.5835, 0.0939375, 0., 0.],
+                       [0.4165, 0.0939375, 0., 0.],
+                       [0.5, 0.04696875, 1., 0.],
+                       [0.5215, 0.04696875, 0., 0.],
+                       [1., 0., 0., 0.],
+                       [0., 0., 0., 0.]]
+
+        self.response = ActionState.VALID_MOVE
+        self._episode_ended = False
+        return ts.restart(np.array(self._state, dtype=np.float32))
+
+    def _step(self, action):
+
+        self.response = self.game.response
+        self._state = self.game.state
+        self.count += 1
+        if self._episode_ended:
+            return self.reset()
+
+        if self.count >= 30:
+            Clock.schedule_once(App.get_running_app().train_env, 0.5)
+            self._episode_ended = True
+            return ts.termination(np.array(self.game.state, dtype=np.float32), -9)
+
+        if self.game.response == ActionState.VALID_MOVE:
+            Clock.schedule_once(App.get_running_app().train_env, 0.5)
+            return ts.transition(np.array(self.game.state, dtype=np.float32), -0.01)
+
+        if self.game.response == ActionState.DOWN_INCREASE:
+            self.game.episode_time = 0
+            Clock.schedule_once(App.get_running_app().train_env, 0.5)
+            return ts.transition(np.array(self.game.state, dtype=np.float32), -0.1)
+
+        if self.game.response == ActionState.CHANGE_POSSESSION:
+            Clock.schedule_once(App.get_running_app().train_env, 0.5)
+            self._episode_ended = True
+            return ts.termination(np.array(self.game.state, dtype=np.float32), -10)
+
+        if self.response == ActionState.TOUCHDOWN:
+            Clock.schedule_once(App.get_running_app().train_env, 0.5)
+            self._episode_ended = True
+            return ts.termination(np.array(self.game.state, dtype=np.float32), 10)
+
+
+class IMAgent(SacAgent):
+
+    def __init__(self,
+                 env: TFPyEnvironment,
+                 observation_spec: TensorSpec = None,
+                 action_spec: TensorSpec = None,
+                 reward_fn: Callable = lambda time_step: time_step.reward,
+                 action_fn: Callable = lambda action: action,
+                 name: str = 'IMAgent',
+                 replay_buffer_max_length: int = 10000,
+                 learning_rate: float = 1e-5,
+                 training_batch_size: int = 30,
+                 training_parallel_calls: int = 3,
+                 training_prefetch_buffer_size: int = 3,
+                 training_num_steps: int = 2,
+                 train_sequence_length = Optional[int],
+                 **dqn_kwargs):
+
+        self._env = env
+        self._reward_fn = reward_fn
+        self._name = name
+        self._observation_spec = observation_spec or self._env.observation_spec()
+
+        self._action_spec = action_spec or self._env.action_spec()
+
+        self._action_fn = action_fn
+        self.actor_network = self._build_actor_net()
+        self.critic_network = self._build_critic_net()
+        act_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        crit_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        env_ts_spec = self._env.time_step_spec()
+        time_step_spec = TimeStep(
+            step_type=env_ts_spec.step_type,
+            reward=env_ts_spec.reward,
+            discount=env_ts_spec.discount,
+            observation=self.actor_network.input_tensor_spec
+        )
+
+        super().__init__(time_step_spec,
+                         self._action_spec,
+                         self.critic_network,
+                         self.actor_network,
+                         act_optimizer,
+                         crit_optimizer,
+                         alpha_optimizer=tf.compat.v1.train.AdamOptimizer(
+                             learning_rate=learning_rate),
+                         **dqn_kwargs)
+
+        self._policy_state = self.policy.get_initial_state(
+            batch_size=self._env.batch_size)
+        self._rewards = []
+
+        self._replay_buffer = TFUniformReplayBuffer(
+            data_spec=self.collect_data_spec,
+            batch_size=self._env.batch_size,
+            max_length=replay_buffer_max_length)
+
+        self._training_batch_size = training_batch_size
+        self._training_parallel_calls = training_parallel_calls
+        self._training_prefetch_buffer_size = training_prefetch_buffer_size
+        self._training_num_steps = training_num_steps
+
+    def _build_actor_net(self):
+
+        fc_layer_params = (50,)
+
+        network = ActorDistributionNetwork(
+            self._observation_spec,
+            self._action_spec,
+            fc_layer_params=fc_layer_params)
+
+        network.create_variables()
+        network.summary()
+
+        return network
+
+    def _build_critic_net(self):
+        #         q_net = QRnnNetwork(input_tensor_spec=self._observation_spec,
+        #                             action_spec=self._action_spec,
+        #                             name=f'{self._name}QRNN')
+
+        fc_layer_params = (50,)
+
+        network = CriticNetwork(
+            (self._observation_spec, self._action_spec))
+
+        network.create_variables()
+        network.summary()
+
+        return network
+
+    def reset(self):
+        self._policy_state = self.policy.get_initial_state(
+            batch_size=self._env.batch_size
+        )
+        self._rewards = []
+
+    def episode_return(self) -> float:
+        return np.sum(self._rewards)
+
+    def _observation_fn(self, observation: tf.Tensor) -> tf.Tensor:
+        """
+            Takes a tensor with specification self._env.observation_spec
+            and extracts a tensor with specification self._observation_spec.
+
+            For example, consider an agent within an NxN maze environment.
+            The env could expose the entire NxN integer matrix as an observation
+            but we would prefer the agent to only see a 3x3 window around their
+            current location. To do this we can override this method.
+
+            This allows us to have different agents acting in the same environment
+            with different observations.
+        """
+        return observation
+
+    def _augment_time_step(self, time_step: TimeStep) -> TimeStep:
+
+        reward = self._reward_fn(time_step)
+        reward = tf.convert_to_tensor(reward, dtype=tf.float32)
+        if reward.shape != time_step.reward.shape:
+            reward = tf.reshape(reward, time_step.reward.shape)
+
+        observation = self._observation_fn(time_step.observation)
+
+        return TimeStep(
+            step_type=time_step.step_type,
+            reward=reward,
+            discount=time_step.discount,
+            observation=observation
+        )
+
+    def _current_time_step(self) -> TimeStep:
+        time_step = self._env.current_time_step()
+        time_step = self._augment_time_step(time_step)
+        return time_step
+
+    def _step_environment(self, action) -> TimeStep:
+        action = self._action_fn(action)
+        time_step = self._env.step(action)
+        time_step = self._augment_time_step(time_step)
+        return time_step
+
+    def act(self, collect=False) -> Trajectory:
+        time_step = self._current_time_step()
+
+        if collect:
+            policy_step = self.collect_policy.action(
+                time_step, policy_state=self._policy_state)
+        else:
+            policy_step = self.policy.action(
+                time_step, policy_state=self._policy_state)
+
+        self._policy_state = policy_step.state
+        #next_time_step = self._step_environment(policy_step.action)
+        #traj = trajectory.from_transition(time_step, policy_step, next_time_step)
+
+        #self._rewards.append(next_time_step.reward)
+
+        #if collect:
+        #    self._replay_buffer.add_batch(traj)
+
+        return self._policy_state
+
+    def train_iteration(self) -> LossInfo:
+        experience, info = self._replay_buffer.get_next(
+            sample_batch_size=self._training_batch_size,
+            num_steps=self._training_num_steps
+        )
+
+        train = self.train(experience)
+        return train
+
+
+def cross_reward_fn(ts: TimeStep) -> float:
+    if ts.reward == -0.01 or ts.reward == -9:
+        return ts.reward
+    else:
+        return ts.reward * -1
+
+
+class FootballApp(App):
+    ball = ObjectProperty()
+    pitch = ObjectProperty()
+    gm = ObjectProperty()
+    gs = ObjectProperty()
+    env = ObjectProperty()
+    noughts = ObjectProperty()
+    crosses = ObjectProperty()
+    response = None
+    state = None
+    n_actions = None
+    c_actions = None
+    time_step = None
+    next_step = None
+    training_episode = 0
+    episodes = 0
+    episode_time = 0
+    episode_clock_ticking = False
+
+    def build(self):
+
+        self.env = NoughtEnv(self)
+        self.env = TFPyEnvironment(self.env)
+        # self.noughts = IMAgent(self.env, action_spec=self.env.action_spec(), name='n')
+        n_arr_spec = BoundedTensorSpec.from_spec(array_spec.BoundedArraySpec((12,), np.float32, minimum=0, maximum=1.2))
+        c_arr_spec = BoundedTensorSpec.from_spec(array_spec.BoundedArraySpec((10,), np.float32, minimum=0, maximum=1.2))
+        self.noughts = IMAgent(self.env, action_spec=n_arr_spec, name='n')
+        self.crosses = IMAgent(self.env, action_spec=c_arr_spec, reward_fn=cross_reward_fn, name='c')
+        n_check = tf.train.Checkpoint(actor_net=self.noughts.actor_network, value_net=self.noughts.critic_network)
+        c_check = tf.train.Checkpoint(actor_net=self.crosses.actor_network, value_net=self.crosses.critic_network)
+        n_check.restore('n_policy3k-1').assert_consumed()
+        c_check.restore('c_policy3k-1').assert_consumed()
+        self.env.reset()
+        Clock.schedule_once(self.train_env, 12)
+        return GameS()
+
+    def train_env(self, dt):
+        if not self.episode_clock_ticking:
+            self.episode_clock_ticking = True
+            Clock.schedule_interval(self.episode_timer, 1)
+        self.time_step = self.env.current_time_step()
+        if not self.time_step.is_last():
+            self.n_actions = self.noughts.collect_policy.action(self.time_step, self.noughts._policy_state)
+            n_moves = np.array(self.n_actions[0]).reshape(12)
+            self.c_actions = self.crosses.collect_policy.action(self.time_step, self.crosses._policy_state)
+            c_moves = np.array(self.c_actions[0]).reshape(10)
+            pitch_action = np.concatenate((n_moves, c_moves))
+            pitch_action = pitch_action.reshape((1, 22))
+            actions = self.n_actions.replace(action=pitch_action)
+            self.pitch.moves = actions
+            self.pitch.set_cross_moves(pitch_action)
+
+        else:
+            self.episodes += 1
+            print(f'episodes completed: {self.episodes}')
+            Clock.unschedule(self.episode_timer)
+            self.episode_time = 0
+            self.episode_clock_ticking = False
+
+            if self.episodes < 2000:
+                self.pitch.reset()
+                self.env.reset()
+                self.crosses.reset()
+                self.noughts.reset()
+                Clock.schedule_once(self.train_env, 0)
+            else:
+                print('training')
+                self.train_agents(0)
+
+    def set_result_and_step(self, response, state, policy_step):
+        Clock.unschedule(self.pitch.tick_move_clock)
+        self.response = response
+        self.state = state
+        try:
+            self.next_step = self.env.step(policy_step)
+            self.collect_data()
+        except ValueError:
+            print('error: restarting episode')
+            self.pitch.reset()
+            self.env.reset()
+            self.crosses.reset()
+            self.noughts.reset()
+            self.episode_time = 0
+            self.episode_clock_ticking = False
+            Clock.unschedule(self.episode_timer)
+            Clock.schedule_once(self.train_env, 0)
+
+    def collect_data(self):
+        n_traj = trajectory.from_transition(self.time_step,
+                                            self.n_actions,
+                                            self.next_step)
+        c_traj = trajectory.from_transition(self.crosses._augment_time_step(self.time_step),
+                                            self.c_actions,
+                                            self.crosses._augment_time_step(self.next_step))
+        self.noughts._replay_buffer.add_batch(n_traj)
+        self.crosses._replay_buffer.add_batch(c_traj)
+
+    def train_agents(self, dt):
+        # n_dataset = self.noughts._replay_buffer.as_dataset(sample_batch_size=1, num_steps=2, single_deterministic_pass=False).prefetch(3)
+        # c_dataset = self.noughts._replay_buffer.as_dataset(sample_batch_size=1, num_steps=2, single_deterministic_pass=False).prefetch(3)
+        n_train = self.noughts.train_iteration()
+        c_train = self.noughts.train_iteration()
+        self.training_episode += 1
+        if self.training_episode == 30000:
+            # print(f'noughts loss: {n_train.loss.numpy()}\ncrosses loss: {c_train.loss.numpy()}')
+            # n_policy_saver = PolicySaver(self.noughts.policy)
+            cwd = os.getcwd()
+            # n_policy_saver.save(cwd + 'noughts_policy')
+            # PolicySaver(self.crosses.policy).save(cwd + 'crosses_policy')
+            # checkpoint_dir = os.path.join(cwd, 'checkpoint')
+            # train_checkpointer = common.Checkpointer(
+            #     ckpt_dir=checkpoint_dir,
+            #     max_to_keep=1,
+            #     agent=agent,
+            #     policy=agent.policy,
+            #     replay_buffer=replay_buffer,
+            #     global_step=global_step
+            # )
+            # train_checkpointer.save(global_step)
+            print('saving')
+            n_check = tf.train.Checkpoint(actor_net=self.noughts.actor_network, value_net=self.noughts.critic_network)
+            c_check = tf.train.Checkpoint(actor_net=self.crosses.actor_network, value_net=self.crosses.critic_network)
+            n_check.save(cwd + './n_policy5k')
+            c_check.save(cwd + './c_policy5k')
+            print('saved')
+        else:
+            Clock.schedule_once(self.train_agents, 0)
+
+    def episode_timer(self, dt):
+        self.episode_time += 1
+        if self.episode_time >= 180:
+            print('too long: resetting episode')
+            self.pitch.reset()
+            self.env.reset()
+            self.crosses.reset()
+            self.noughts.reset()
+            self.episode_time = 0
+            self.episode_clock_ticking = False
+            Clock.unschedule(self.episode_timer)
+            Clock.schedule_once(self.train_env, 0)
+
+
+App = FootballApp().run()
