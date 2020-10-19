@@ -45,7 +45,9 @@ class ActionState(Enum):
 class NoughtEnv(PyEnvironment):
 
     def __init__(self, game):
+        # environment action_spec is a 22 dim array, which is a combination of the 10 dim array from one agent, and 12 dim array from the other
         self._action_spec = array_spec.BoundedArraySpec((22,), np.float32, minimum=0, maximum=1.5, name='moves')
+        # envrionment observation spec is 13x4 as it is for the agents who see the same observation
         self._observation_spec = array_spec.BoundedArraySpec((13, 4), np.float32, minimum=0, maximum=1, name='field')
         self._episode_ended = False
         self.game = game
@@ -206,10 +208,7 @@ class IMAgent(SacAgent):
         return network
 
     def _build_critic_net(self):
-        #         q_net = QRnnNetwork(input_tensor_spec=self._observation_spec,
-        #                             action_spec=self._action_spec,
-        #                             name=f'{self._name}QRNN')
-
+    
         fc_layer_params = (50,)
 
         network = CriticNetwork(
@@ -230,6 +229,7 @@ class IMAgent(SacAgent):
         return np.sum(self._rewards)
 
     def _observation_fn(self, observation: tf.Tensor) -> tf.Tensor:
+    # the below comment is directly from Dylan Cope
         """
             Takes a tensor with specification self._env.observation_spec
             and extracts a tensor with specification self._observation_spec.
@@ -243,6 +243,8 @@ class IMAgent(SacAgent):
             with different observations.
         """
         return observation
+
+# augment fuction, which can return a time step with the appropriate awards for that agent
 
     def _augment_time_step(self, time_step: TimeStep) -> TimeStep:
 
@@ -259,39 +261,7 @@ class IMAgent(SacAgent):
             discount=time_step.discount,
             observation=observation
         )
-
-    def _current_time_step(self) -> TimeStep:
-        time_step = self._env.current_time_step()
-        time_step = self._augment_time_step(time_step)
-        return time_step
-
-    def _step_environment(self, action) -> TimeStep:
-        action = self._action_fn(action)
-        time_step = self._env.step(action)
-        time_step = self._augment_time_step(time_step)
-        return time_step
-
-    def act(self, collect=False) -> Trajectory:
-        time_step = self._current_time_step()
-
-        if collect:
-            policy_step = self.collect_policy.action(
-                time_step, policy_state=self._policy_state)
-        else:
-            policy_step = self.policy.action(
-                time_step, policy_state=self._policy_state)
-
-        self._policy_state = policy_step.state
-        #next_time_step = self._step_environment(policy_step.action)
-        #traj = trajectory.from_transition(time_step, policy_step, next_time_step)
-
-        #self._rewards.append(next_time_step.reward)
-
-        #if collect:
-        #    self._replay_buffer.add_batch(traj)
-
-        return self._policy_state
-
+    
     def train_iteration(self) -> LossInfo:
         experience, info = self._replay_buffer.get_next(
             sample_batch_size=self._training_batch_size,
@@ -302,12 +272,15 @@ class IMAgent(SacAgent):
         return train
 
 
+# custom reward function I use for one agent
 def cross_reward_fn(ts: TimeStep) -> float:
     if ts.reward == -0.01 or ts.reward == -9:
         return ts.reward
     else:
         return ts.reward * -1
 
+
+# Begining of Kivy App, which runs the game engine to determinate results of actions, and makes calls to the environment and agents
 
 class FootballApp(App):
     ball = ObjectProperty()
@@ -332,15 +305,11 @@ class FootballApp(App):
 
         self.env = NoughtEnv(self)
         self.env = TFPyEnvironment(self.env)
-        # self.noughts = IMAgent(self.env, action_spec=self.env.action_spec(), name='n')
+        # creating custom action specs for each agent
         n_arr_spec = BoundedTensorSpec.from_spec(array_spec.BoundedArraySpec((12,), np.float32, minimum=0, maximum=1.2))
         c_arr_spec = BoundedTensorSpec.from_spec(array_spec.BoundedArraySpec((10,), np.float32, minimum=0, maximum=1.2))
         self.noughts = IMAgent(self.env, action_spec=n_arr_spec, name='n')
         self.crosses = IMAgent(self.env, action_spec=c_arr_spec, reward_fn=cross_reward_fn, name='c')
-        n_check = tf.train.Checkpoint(actor_net=self.noughts.actor_network, value_net=self.noughts.critic_network)
-        c_check = tf.train.Checkpoint(actor_net=self.crosses.actor_network, value_net=self.crosses.critic_network)
-        n_check.restore('n_policy3k-1').assert_consumed()
-        c_check.restore('c_policy3k-1').assert_consumed()
         self.env.reset()
         Clock.schedule_once(self.train_env, 12)
         return GameS()
@@ -367,7 +336,8 @@ class FootballApp(App):
             Clock.unschedule(self.episode_timer)
             self.episode_time = 0
             self.episode_clock_ticking = False
-
+            
+# set number of episodes you want to train for
             if self.episodes < 2000:
                 self.pitch.reset()
                 self.env.reset()
@@ -375,6 +345,7 @@ class FootballApp(App):
                 self.noughts.reset()
                 Clock.schedule_once(self.train_env, 0)
             else:
+            # start training loop
                 print('training')
                 self.train_agents(0)
 
@@ -407,27 +378,13 @@ class FootballApp(App):
         self.crosses._replay_buffer.add_batch(c_traj)
 
     def train_agents(self, dt):
-        # n_dataset = self.noughts._replay_buffer.as_dataset(sample_batch_size=1, num_steps=2, single_deterministic_pass=False).prefetch(3)
-        # c_dataset = self.noughts._replay_buffer.as_dataset(sample_batch_size=1, num_steps=2, single_deterministic_pass=False).prefetch(3)
+    
         n_train = self.noughts.train_iteration()
         c_train = self.noughts.train_iteration()
         self.training_episode += 1
         if self.training_episode == 30000:
-            # print(f'noughts loss: {n_train.loss.numpy()}\ncrosses loss: {c_train.loss.numpy()}')
-            # n_policy_saver = PolicySaver(self.noughts.policy)
+        # once 30000 training iterations complete, checkpointing weights for later training
             cwd = os.getcwd()
-            # n_policy_saver.save(cwd + 'noughts_policy')
-            # PolicySaver(self.crosses.policy).save(cwd + 'crosses_policy')
-            # checkpoint_dir = os.path.join(cwd, 'checkpoint')
-            # train_checkpointer = common.Checkpointer(
-            #     ckpt_dir=checkpoint_dir,
-            #     max_to_keep=1,
-            #     agent=agent,
-            #     policy=agent.policy,
-            #     replay_buffer=replay_buffer,
-            #     global_step=global_step
-            # )
-            # train_checkpointer.save(global_step)
             print('saving')
             n_check = tf.train.Checkpoint(actor_net=self.noughts.actor_network, value_net=self.noughts.critic_network)
             c_check = tf.train.Checkpoint(actor_net=self.crosses.actor_network, value_net=self.crosses.critic_network)
