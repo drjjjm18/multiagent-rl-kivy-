@@ -320,14 +320,17 @@ class FootballApp(App):
             Clock.schedule_interval(self.episode_timer, 1)
         self.time_step = self.env.current_time_step()
         if not self.time_step.is_last():
+            # get the actions from the agents
             self.n_actions = self.noughts.collect_policy.action(self.time_step, self.noughts._policy_state)
             n_moves = np.array(self.n_actions[0]).reshape(12)
             self.c_actions = self.crosses.collect_policy.action(self.time_step, self.crosses._policy_state)
             c_moves = np.array(self.c_actions[0]).reshape(10)
+            # combine those actions into a single policy step fitting the environments action_spec
             pitch_action = np.concatenate((n_moves, c_moves))
             pitch_action = pitch_action.reshape((1, 22))
             actions = self.n_actions.replace(action=pitch_action)
             self.pitch.moves = actions
+            # this is a call to the game engine to calculate the result, which calls App.set_result_and_step()
             self.pitch.set_cross_moves(pitch_action)
 
         else:
@@ -348,6 +351,8 @@ class FootballApp(App):
             # start training loop
                 print('training')
                 self.train_agents(0)
+                
+# this is called once the game engine gets a result. It passes the response and observation to the environment, which creates the timestep. 
 
     def set_result_and_step(self, response, state, policy_step):
         Clock.unschedule(self.pitch.tick_move_clock)
